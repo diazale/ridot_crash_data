@@ -1,0 +1,200 @@
+---
+title: "Testing a QC Pipeline"
+output: html_notebook
+---
+
+```{r libraries}
+library(tidyverse)
+library(readxl)
+```
+
+```{r call required scripts}
+source("ri_helpers.R")
+source("ri_geocode_general.R")
+```
+
+```{r import and clean data}
+# Import the spreadsheets and do some basic formatting
+# Convert dates and lat/lon to correct data types
+# Combine ped/cyc data into combined ("com") and use this data frame
+data_dir <- "data"
+
+cyc <- read_xlsx(file.path(data_dir, "Bike Crashes 2013 - present.xlsx"))
+ped <- read_xlsx(file.path(data_dir, "Pedestrian Crashes 2013 - present.xlsx"))
+
+# Combine pedestrian and cyclist data into one
+cyc$TypeOfCrash <- "Cyc"
+ped$TypeOfCrash <- "Ped"
+
+com <- rbind.data.frame(cyc, ped)
+
+# Format dates and numbers that we use
+com$CrashDate <- as.Date(com$CrashDate, "%m/%d/%Y")
+com$LatitudeGeoLocated <- as.numeric(com$LatitudeGeoLocated)
+com$LongitudeGeoLocated <- as.numeric(com$LongitudeGeoLocated)
+com$LatitudeOfficerCoded <- as.numeric(com$LatitudeOfficerCoded)
+com$LongitudeOfficerCoded <- as.numeric(com$LongitudeOfficerCoded)
+
+# Masks for the coordinates if they're in RI
+com$GeoLocatedInRI <- in_rhode_island(com$LatitudeGeoLocated, com$LongitudeGeoLocated)
+com$OfficerCodedInRI <- in_rhode_island(com$LatitudeOfficerCoded, com$LongitudeOfficerCoded)
+```
+
+```{r Geocoding}
+# Make API calls to do the geocoding based on intersections or addresses
+geocoded_intersections <- geocode_locations(com, "CityOrTown", 
+                                            "StreetOrHighway", 
+                                            "NearestIntersectionOfficerCoded",
+                                            cache_dir = "cache/int")
+# Address call doesn't use the second field
+geocoded_addresses <- geocode_locations(com, "CityOrTown", 
+                                        "StreetOrHighway", 
+                                        street2 = NULL, 
+                                        cache_dir = "cache/addr")
+```
+```{r assess quality}
+# Run through some logic to assess the quality of the coordinates
+# Depending on what we see, we pick the most reliable coordinates
+
+
+# Add calculated coordinates (our geolocations)
+com$LatitudeCalculatedAddress <- geocoded_addresses$geocoded_lat
+com$LongitudeCalculatedAddress <- geocoded_addresses$geocoded_lon
+com$LatitudeCalculatedInt <- geocoded_intersections$geocoded_lat
+com$LongitudeCalculatedInt <- geocoded_intersections$geocoded_lon
+
+# Check if calculated coords are in RI
+com$CalculatedAddressInRI <- in_rhode_island(com$LatitudeCalculatedAddress, com$LongitudeCalculatedAddress)
+com$CalculatedIntInRI <- in_rhode_island(com$LatitudeCalculatedInt, com$LongitudeCalculatedInt)
+
+# Levels of agreement:
+### Calculate some differences
+# Officer vs geolocated codings
+diff_officer_geolocated <-
+  geo_distance(
+    com$LatitudeOfficerCoded, com$LongitudeOfficerCoded,
+    com$LatitudeGeoLocated, com$LongitudeGeoLocated, "m"
+  )
+
+# Differences by calculated address
+diff_addr_officer <- 
+  geo_distance(
+    com$LatitudeCalculatedAddress, com$LongitudeCalculatedAddress,
+    com$LatitudeOfficerCoded, com$LongitudeOfficerCoded, "m"
+    )
+diff_addr_geolocated <-
+  geo_distance(
+    com$LatitudeCalculatedAddress, com$LongitudeCalculatedAddress,
+    com$LatitudeGeoLocated, com$LongitudeGeoLocated, "m"
+  )
+
+# Differences by calculated intersection
+diff_intersection_officer <- 
+  geo_distance(
+    com$LatitudeCalculatedInt, com$LongitudeCalculatedInt,
+    com$LatitudeOfficerCoded, com$LongitudeOfficerCoded, "m"
+    )
+diff_intersection_geolocated <-
+  geo_distance(
+    com$LatitudeCalculatedInt, com$LongitudeCalculatedInt,
+    com$LatitudeGeoLocated, com$LongitudeGeoLocated, "m"
+  )
+
+tolerance <- 200 # Metres (100m ~ 330ft; 1600m ~ 1 mile)
+
+# Subset and assign the best variable
+# In general, take OfficerCoded when values are similar
+# If only GeoLocated is available but still close, take that
+com_high_quality <- 
+  com %>%
+  mutate(
+    best_coord = case_when(
+      # All three are close. Take OfficerCoded as best
+      # First case is when we have calculated address,
+      # second is when we have calculated intersection
+      diff_officer_geolocated < tolerance & 
+        diff_addr_geolocated < tolerance & 
+        diff_addr_officer < tolerance & 
+        OfficerCodedInRI ~ "OfficerCoded",
+       diff_officer_geolocated < tolerance &
+        diff_intersection_geolocated < tolerance & 
+        diff_intersection_officer < tolerance & 
+        OfficerCodedInRI ~ "OfficerCoded",
+      # Couldn't calculate an intersection or address,
+      # but OfficerCoded and GeoLocated are similar
+      # Likely an error in our parsing/geocoding
+      is.na(diff_intersection_geolocated) &
+        diff_officer_geolocated < tolerance & 
+        OfficerCodedInRI~ "OfficerCoded",
+      is.na(diff_addr_geolocated) & 
+        diff_officer_geolocated &
+        OfficerCodedInRI < tolerance ~ "OfficerCoded",
+      # Difference between calculated coordinates and OfficerCoded
+      # or GeoLocated is within tolerance
+      # Take whichever is available
+      diff_intersection_geolocated < tolerance &
+        GeoLocatedInRI ~ "GeoLocated",
+      diff_intersection_officer < tolerance & 
+        OfficerCodedInRI~ "OfficerCoded"
+    )
+  ) %>%
+  filter(!is.na(best_coord)) %>%
+  mutate(quality="High")
+
+# Medium quality
+# Some of these may not be possible to resolve fully
+# But we can use some logic to work out which one we think is correct
+com_med_quality <- 
+  com %>%
+  filter(!(CrashReportId %in% com_high_quality$CrashReportId)) %>%
+  mutate(
+    best_coord = case_when(
+      # Location is given as "At Intersection" and we are able to calculate an intersection or address
+      # Likely an error in OfficerCoded or GeoLocated or both
+      DirectionFromNearestIntersectionToCrashSite=="At Intersection" &
+        CalculatedIntInRI ~ "CalculatedIntersection",
+      DirectionFromNearestIntersectionToCrashSite=="At Intersection" &
+        CalculatedAddressInRI ~ "CalculatedAddress",
+      # We have an exact address and it's within a mile of the GeoLocated incident
+      # Here we assume the GeoLocated location is fine
+      is.na(NearestIntersectionOfficerCoded) &
+        !is.na(LatitudeCalculatedAddress) &
+        geo_distance(LatitudeCalculatedAddress,LongitudeCalculatedAddress,
+                     LatitudeGeoLocated, LongitudeGeoLocated) <= 1600 ~ "GeoLocated",
+      # If we're over a mile away, go with the calculated address
+      is.na(NearestIntersectionOfficerCoded) &
+        !is.na(LatitudeCalculatedAddress) &
+        geo_distance(LatitudeCalculatedAddress,LongitudeCalculatedAddress,
+                     LatitudeGeoLocated, LongitudeGeoLocated) > 1600 ~ "CalculatedAddress",
+      # GeoLocated and OfficerCoded disagree with each other but one agrees with a calculated lon/lat
+      # OfficerCoded is closer
+      geo_distance(LatitudeOfficerCoded, LongitudeOfficerCoded,
+                   LatitudeCalculatedAddress, LongitudeCalculatedAddress) < tolerance |
+        geo_distance(LatitudeOfficerCoded, LongitudeOfficerCoded,
+                     LatitudeCalculatedInt, LongitudeCalculatedInt) < tolerance ~ "OfficerCoded",
+      # GeoLocated is closer
+      geo_distance(LatitudeGeoLocated, LongitudeGeoLocated,
+                   LatitudeCalculatedAddress, LongitudeCalculatedAddress) < tolerance |
+        geo_distance(LatitudeGeoLocated, LongitudeGeoLocated,
+                     LatitudeCalculatedInt, LongitudeCalculatedInt) < tolerance ~ "GeoLocated",
+      # Neither GeoLocated nor OfficerCoded are in RI, but we calculated something
+      !OfficerCodedInRI & !GeoLocatedInRI &
+        CalculatedIntInRI ~ "CalculatedIntersection",
+      !OfficerCodedInRI & !GeoLocatedInRI &
+        CalculatedAddressInRI ~ "CalculatedAddress"
+    )
+  ) %>%
+  filter(!is.na(best_coord)) %>%
+  mutate(quality="Medium")
+
+com_remaining <- subset(com,
+                       !(CrashReportId %in% com_med_quality$CrashReportId | 
+                           CrashReportId %in% com_high_quality$CrashReportId))
+
+com_remaining <- 
+  com_remaining %>%
+  mutate(quality="Low", best_coord = "Unknown")
+
+com_qc <- rbind.data.frame(com_high_quality, com_med_quality, com_remaining)
+
+```
